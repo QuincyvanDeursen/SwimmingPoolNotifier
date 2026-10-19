@@ -463,6 +463,9 @@ public class PoolScraperService : IPoolScraperService
         using var client = new HttpClient(handler);
         client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36");
         client.DefaultRequestHeaders.Add("Accept", "application/json, text/plain, */*");
+        client.DefaultRequestHeaders.Add("Referer", "https://www.optisport.nl/");
+        client.DefaultRequestHeaders.Add("Origin", "https://www.optisport.nl");
+        client.DefaultRequestHeaders.Add("X-Requested-With", "XMLHttpRequest");
 
         string token = string.Empty;
         try
@@ -470,7 +473,11 @@ public class PoolScraperService : IPoolScraperService
             var tokenResp = await client.GetAsync("https://www.optisport.nl/api/optisport/token", cancellationToken);
             if (tokenResp.IsSuccessStatusCode)
             {
-                token = (await tokenResp.Content.ReadAsStringAsync(cancellationToken)).Trim();
+                var potentialToken = (await tokenResp.Content.ReadAsStringAsync(cancellationToken)).Trim();
+                if (!potentialToken.StartsWith("<") && !potentialToken.Contains("<html") && potentialToken.Length < 100)
+                {
+                    token = potentialToken;
+                }
             }
         }
         catch (Exception ex)
@@ -496,6 +503,9 @@ public class PoolScraperService : IPoolScraperService
             Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
         };
         postReq.Headers.Add("X-CSRF-Token", token);
+        postReq.Headers.Add("Referer", "https://www.optisport.nl/");
+        postReq.Headers.Add("Origin", "https://www.optisport.nl");
+        postReq.Headers.Add("X-Requested-With", "XMLHttpRequest");
 
         var apiResp = await client.SendAsync(postReq, cancellationToken);
         if (!apiResp.IsSuccessStatusCode)
@@ -504,6 +514,11 @@ public class PoolScraperService : IPoolScraperService
         }
 
         var json = await apiResp.Content.ReadAsStringAsync(cancellationToken);
+        if (json.StartsWith("<") || json.Contains("<html"))
+        {
+            return await FetchDaysViaCurlFallbackAsync(locationId, activityId);
+        }
+
         return ParseDaysFromJson(json);
     }
 
@@ -528,11 +543,24 @@ public class PoolScraperService : IPoolScraperService
             tokenPsi.ArgumentList.Add(cookieFile);
             tokenPsi.ArgumentList.Add("-H");
             tokenPsi.ArgumentList.Add("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36");
+            tokenPsi.ArgumentList.Add("-H");
+            tokenPsi.ArgumentList.Add("Accept: application/json, text/plain, */*");
+            tokenPsi.ArgumentList.Add("-H");
+            tokenPsi.ArgumentList.Add("Referer: https://www.optisport.nl/");
+            tokenPsi.ArgumentList.Add("-H");
+            tokenPsi.ArgumentList.Add("Origin: https://www.optisport.nl");
+            tokenPsi.ArgumentList.Add("-H");
+            tokenPsi.ArgumentList.Add("X-Requested-With: XMLHttpRequest");
             tokenPsi.ArgumentList.Add("https://www.optisport.nl/api/optisport/token");
 
             using var tokenProc = Process.Start(tokenPsi) ?? throw new InvalidOperationException("Failed to run curl.");
             string token = (await tokenProc.StandardOutput.ReadToEndAsync()).Trim();
             await tokenProc.WaitForExitAsync();
+
+            if (token.StartsWith("<") || token.Contains("<html") || string.IsNullOrWhiteSpace(token))
+            {
+                throw new InvalidOperationException($"Optisport token endpoint did not return a valid CSRF token. Output was: {(token.Length > 150 ? token.Substring(0, 150) + "..." : token)}");
+            }
 
             string jsonPayload = $"{{\"page\":0,\"locationId\":{locationId},\"activityId\":{activityId},\"amount\":\"medium\"}}";
             var apiPsi = new ProcessStartInfo
@@ -553,6 +581,14 @@ public class PoolScraperService : IPoolScraperService
             apiPsi.ArgumentList.Add("-H");
             apiPsi.ArgumentList.Add("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36");
             apiPsi.ArgumentList.Add("-H");
+            apiPsi.ArgumentList.Add("Accept: application/json, text/plain, */*");
+            apiPsi.ArgumentList.Add("-H");
+            apiPsi.ArgumentList.Add("Referer: https://www.optisport.nl/");
+            apiPsi.ArgumentList.Add("-H");
+            apiPsi.ArgumentList.Add("Origin: https://www.optisport.nl");
+            apiPsi.ArgumentList.Add("-H");
+            apiPsi.ArgumentList.Add("X-Requested-With: XMLHttpRequest");
+            apiPsi.ArgumentList.Add("-H");
             apiPsi.ArgumentList.Add("Content-Type: application/json");
             apiPsi.ArgumentList.Add("-H");
             apiPsi.ArgumentList.Add($"X-CSRF-Token: {token}");
@@ -562,6 +598,11 @@ public class PoolScraperService : IPoolScraperService
             using var apiProc = Process.Start(apiPsi) ?? throw new InvalidOperationException("Failed to run curl API call.");
             string json = await apiProc.StandardOutput.ReadToEndAsync();
             await apiProc.WaitForExitAsync();
+
+            if (json.StartsWith("<") || json.Contains("<html") || string.IsNullOrWhiteSpace(json))
+            {
+                throw new InvalidOperationException($"Optisport upcomingeventsschedule API returned non-JSON/HTML output: {(json.Length > 150 ? json.Substring(0, 150) + "..." : json)}");
+            }
 
             return ParseDaysFromJson(json);
         }
