@@ -1,0 +1,23 @@
+## Visual Studio / VS Code
+.vs/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## Build outputs
+bin/
+obj/
+*.dll
+*.pdb
+
+## Azure Functions / Local settings
+local.settings.json
+
+## Azurite / Storage Emulator
+__blobstorage__/
+__queuestorage__/
+__tablestorage__/
+azurite/
+*.txt

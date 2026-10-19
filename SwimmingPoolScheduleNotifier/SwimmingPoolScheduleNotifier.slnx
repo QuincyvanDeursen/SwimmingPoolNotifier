@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="../SwimmingPoolScheduleNotifier.Tests/SwimmingPoolScheduleNotifier.Tests.csproj" />
+  <Project Path="SwimmingPoolScheduleNotifier.csproj" />
+</Solution>
