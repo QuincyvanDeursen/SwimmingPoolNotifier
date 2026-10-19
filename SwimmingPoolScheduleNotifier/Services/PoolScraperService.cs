@@ -1,12 +1,12 @@
-using System.Diagnostics;
 using System.Globalization;
-using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using AngleSharp;
 using AngleSharp.Dom;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Playwright;
 
 namespace SwimmingPoolScheduleNotifier.Services;
 
@@ -50,7 +50,7 @@ public class LocationScheduleModel
 
 public class PoolScraperService : IPoolScraperService
 {
-    private readonly IHttpClientFactory _httpClientFactory;
+    private readonly IHttpClientFactory? _httpClientFactory;
     private readonly ILogger<PoolScraperService> _logger;
 
     public const string EventsContainerSelector = "ul.planning-page__events";
@@ -59,10 +59,10 @@ public class PoolScraperService : IPoolScraperService
     public const string EventArticleSelector = "article.planning-event";
     public const string EventTitleSelector = ".planning-event__title";
 
-    public PoolScraperService(IHttpClientFactory httpClientFactory, ILogger<PoolScraperService> logger)
+    public PoolScraperService(IHttpClientFactory? httpClientFactory = null, ILogger<PoolScraperService>? logger = null)
     {
         _httpClientFactory = httpClientFactory;
-        _logger = logger;
+        _logger = logger ?? NullLogger<PoolScraperService>.Instance;
     }
 
     public async Task<string> ScrapeScheduleAsync(string url, CancellationToken cancellationToken = default)
@@ -75,16 +75,32 @@ public class PoolScraperService : IPoolScraperService
     {
         var locationList = new List<LocationScheduleModel>();
 
-        foreach (var url in urls.Where(u => !string.IsNullOrWhiteSpace(u)))
+        using var playwright = await Playwright.CreateAsync();
+        IBrowser? browser = null;
+
+        try
         {
-            try
+            browser = await LaunchBrowserAsync(playwright);
+
+            foreach (var url in urls.Where(u => !string.IsNullOrWhiteSpace(u)))
             {
-                var loc = await ScrapeLocationScheduleAsync(url.Trim(), cancellationToken);
-                locationList.Add(loc);
+                try
+                {
+                    var loc = await ScrapeLocationWithBrowserAsync(browser, url.Trim(), cancellationToken);
+                    locationList.Add(loc);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to scrape schedule for location URL: {url}", url);
+                }
             }
-            catch (Exception ex)
+        }
+        finally
+        {
+            if (browser != null)
             {
-                _logger.LogError(ex, "Failed to scrape schedule for location URL: {url}", url);
+                await browser.CloseAsync();
+                await browser.DisposeAsync();
             }
         }
 
@@ -98,39 +114,116 @@ public class PoolScraperService : IPoolScraperService
 
     public async Task<LocationScheduleModel> ScrapeLocationScheduleAsync(string url, CancellationToken cancellationToken = default)
     {
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await LaunchBrowserAsync(playwright);
+        return await ScrapeLocationWithBrowserAsync(browser, url, cancellationToken);
+    }
+
+    private static async Task<IBrowser> LaunchBrowserAsync(IPlaywright playwright)
+    {
+        var launchOptions = new BrowserTypeLaunchOptions
+        {
+            Headless = true,
+            Args = new[]
+            {
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled"
+            }
+        };
+
+        try
+        {
+            return await playwright.Chromium.LaunchAsync(launchOptions);
+        }
+        catch (PlaywrightException)
+        {
+            // Auto-install chromium if not yet present
+            Microsoft.Playwright.Program.Main(new[] { "install", "chromium" });
+            return await playwright.Chromium.LaunchAsync(launchOptions);
+        }
+    }
+
+    private async Task<LocationScheduleModel> ScrapeLocationWithBrowserAsync(IBrowser browser, string url, CancellationToken cancellationToken)
+    {
         _logger.LogInformation("Starting schedule scraping for URL: {url}", url);
 
-        string html = await FetchHtmlAsync(url, cancellationToken);
-        if (string.IsNullOrWhiteSpace(html))
+        var context = await browser.NewContextAsync(new BrowserNewContextOptions
         {
-            throw new HttpRequestException($"Received empty HTML response from: {url}");
-        }
+            UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+            Locale = "nl-NL",
+            ViewportSize = new ViewportSize { Width = 1280, Height = 800 }
+        });
 
-        var browsingContext = BrowsingContext.New(Configuration.Default);
-        var document = await browsingContext.OpenAsync(req => req.Content(html), cancellationToken);
-
-        string locationName = ExtractLocationName(url, document);
-
-        var eventsContainer = document.QuerySelector(EventsContainerSelector);
-        if (eventsContainer != null)
+        try
         {
-            _logger.LogInformation("Found rendered events container for '{location}'. Parsing DOM...", locationName);
-            var days = ParseDaysFromDom(document);
-            return new LocationScheduleModel { LocationName = locationName, Days = days };
-        }
+            var page = await context.NewPageAsync();
+            string? capturedScheduleJson = null;
 
-        var planningComponent = document.QuerySelector("#planning-component");
-        if (planningComponent != null)
+            page.Response += async (_, response) =>
+            {
+                if (response.Url.Contains("upcomingeventsschedule", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        var body = await response.TextAsync();
+                        if (!string.IsNullOrWhiteSpace(body) && !body.StartsWith("<"))
+                        {
+                            capturedScheduleJson = body;
+                        }
+                    }
+                    catch
+                    {
+                        // Ignore response read exceptions during page teardown
+                    }
+                }
+            };
+
+            await page.GotoAsync(url, new PageGotoOptions
+            {
+                WaitUntil = WaitUntilState.DOMContentLoaded,
+                Timeout = 60000
+            });
+
+            // Wait for intercepted API response
+            var deadline = DateTime.UtcNow.AddSeconds(15);
+            while (capturedScheduleJson == null && DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(300, cancellationToken);
+            }
+
+            string locationName = ExtractLocationName(url);
+
+            if (!string.IsNullOrWhiteSpace(capturedScheduleJson))
+            {
+                _logger.LogInformation("Successfully intercepted API schedule response for '{location}'.", locationName);
+                var days = ParseDaysFromJson(capturedScheduleJson);
+                return new LocationScheduleModel { LocationName = locationName, Days = days };
+            }
+
+            // Fallback: check if the DOM container was rendered directly
+            try
+            {
+                await page.WaitForSelectorAsync(EventsContainerSelector, new PageWaitForSelectorOptions { Timeout = 5000 });
+                var content = await page.ContentAsync();
+                var browsingContext = BrowsingContext.New(Configuration.Default);
+                var document = await browsingContext.OpenAsync(req => req.Content(content), cancellationToken);
+                var domLocationName = ExtractLocationName(url, document);
+                var days = ParseDaysFromDom(document);
+                return new LocationScheduleModel { LocationName = domLocationName, Days = days };
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "DOM container not found for '{location}'.", locationName);
+            }
+
+            throw new InvalidOperationException($"Could not retrieve schedule data for {url}. No API response intercepted or DOM container found.");
+        }
+        finally
         {
-            _logger.LogInformation("Detected client-side Vue component for '{location}'. Querying API...", locationName);
-            var locationId = planningComponent.GetAttribute("data-location-id") ?? "2296";
-            var activityId = planningComponent.GetAttribute("data-activity-id") ?? "30";
-            var days = await FetchDaysFromApiAsync(locationId, activityId, cancellationToken);
-            return new LocationScheduleModel { LocationName = locationName, Days = days };
+            await context.CloseAsync();
+            await context.DisposeAsync();
         }
-
-        throw new InvalidOperationException(
-            $"Could not find schedule container ('{EventsContainerSelector}') or '#planning-component' in webpage HTML for {url}.");
     }
 
     public List<DayScheduleModel> ParseDaysFromDom(IDocument document)
@@ -427,7 +520,7 @@ public class PoolScraperService : IPoolScraperService
         return sb.ToString().Trim();
     }
 
-    private static string ExtractLocationName(string url, IDocument? document = null)
+    public static string ExtractLocationName(string url, IDocument? document = null)
     {
         if (url.Contains("zwembad-de-wisselaar", StringComparison.OrdinalIgnoreCase))
             return "Zwembad De Wisselaar";
@@ -450,172 +543,7 @@ public class PoolScraperService : IPoolScraperService
         return "Zwembad Breda";
     }
 
-    private async Task<List<DayScheduleModel>> FetchDaysFromApiAsync(string locationId, string activityId, CancellationToken cancellationToken)
-    {
-        var cookieContainer = new CookieContainer();
-        using var handler = new SocketsHttpHandler
-        {
-            CookieContainer = cookieContainer,
-            UseCookies = true,
-            AutomaticDecompression = DecompressionMethods.All
-        };
-
-        using var client = new HttpClient(handler);
-        client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36");
-        client.DefaultRequestHeaders.Add("Accept", "application/json, text/plain, */*");
-        client.DefaultRequestHeaders.Add("Referer", "https://www.optisport.nl/");
-        client.DefaultRequestHeaders.Add("Origin", "https://www.optisport.nl");
-        client.DefaultRequestHeaders.Add("X-Requested-With", "XMLHttpRequest");
-
-        string token = string.Empty;
-        try
-        {
-            var tokenResp = await client.GetAsync("https://www.optisport.nl/api/optisport/token", cancellationToken);
-            if (tokenResp.IsSuccessStatusCode)
-            {
-                var potentialToken = (await tokenResp.Content.ReadAsStringAsync(cancellationToken)).Trim();
-                if (!potentialToken.StartsWith("<") && !potentialToken.Contains("<html") && potentialToken.Length < 100)
-                {
-                    token = potentialToken;
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Could not fetch CSRF token via HttpClient. Attempting curl fallback...");
-        }
-
-        if (string.IsNullOrWhiteSpace(token))
-        {
-            return await FetchDaysViaCurlFallbackAsync(locationId, activityId);
-        }
-
-        var payload = new
-        {
-            page = 0,
-            locationId = int.Parse(locationId),
-            activityId = int.Parse(activityId),
-            amount = "medium"
-        };
-
-        using var postReq = new HttpRequestMessage(HttpMethod.Post, "https://www.optisport.nl/api/optisport/v1/upcomingeventsschedule")
-        {
-            Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
-        };
-        postReq.Headers.Add("X-CSRF-Token", token);
-        postReq.Headers.Add("Referer", "https://www.optisport.nl/");
-        postReq.Headers.Add("Origin", "https://www.optisport.nl");
-        postReq.Headers.Add("X-Requested-With", "XMLHttpRequest");
-
-        var apiResp = await client.SendAsync(postReq, cancellationToken);
-        if (!apiResp.IsSuccessStatusCode)
-        {
-            return await FetchDaysViaCurlFallbackAsync(locationId, activityId);
-        }
-
-        var json = await apiResp.Content.ReadAsStringAsync(cancellationToken);
-        if (json.StartsWith("<") || json.Contains("<html"))
-        {
-            return await FetchDaysViaCurlFallbackAsync(locationId, activityId);
-        }
-
-        return ParseDaysFromJson(json);
-    }
-
-    private static string CurlExecutable => OperatingSystem.IsWindows() ? "curl.exe" : "curl";
-
-    private static async Task<List<DayScheduleModel>> FetchDaysViaCurlFallbackAsync(string locationId, string activityId)
-    {
-        string cookieFile = Path.Combine(Path.GetTempPath(), $"optisport_cookies_{Guid.NewGuid():N}.txt");
-        try
-        {
-            var tokenPsi = new ProcessStartInfo
-            {
-                FileName = CurlExecutable,
-                RedirectStandardOutput = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-            tokenPsi.ArgumentList.Add("-s");
-            tokenPsi.ArgumentList.Add("-c");
-            tokenPsi.ArgumentList.Add(cookieFile);
-            tokenPsi.ArgumentList.Add("-b");
-            tokenPsi.ArgumentList.Add(cookieFile);
-            tokenPsi.ArgumentList.Add("-H");
-            tokenPsi.ArgumentList.Add("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36");
-            tokenPsi.ArgumentList.Add("-H");
-            tokenPsi.ArgumentList.Add("Accept: application/json, text/plain, */*");
-            tokenPsi.ArgumentList.Add("-H");
-            tokenPsi.ArgumentList.Add("Referer: https://www.optisport.nl/");
-            tokenPsi.ArgumentList.Add("-H");
-            tokenPsi.ArgumentList.Add("Origin: https://www.optisport.nl");
-            tokenPsi.ArgumentList.Add("-H");
-            tokenPsi.ArgumentList.Add("X-Requested-With: XMLHttpRequest");
-            tokenPsi.ArgumentList.Add("https://www.optisport.nl/api/optisport/token");
-
-            using var tokenProc = Process.Start(tokenPsi) ?? throw new InvalidOperationException("Failed to run curl.");
-            string token = (await tokenProc.StandardOutput.ReadToEndAsync()).Trim();
-            await tokenProc.WaitForExitAsync();
-
-            if (token.StartsWith("<") || token.Contains("<html") || string.IsNullOrWhiteSpace(token))
-            {
-                throw new InvalidOperationException($"Optisport token endpoint did not return a valid CSRF token. Output was: {(token.Length > 150 ? token.Substring(0, 150) + "..." : token)}");
-            }
-
-            string jsonPayload = $"{{\"page\":0,\"locationId\":{locationId},\"activityId\":{activityId},\"amount\":\"medium\"}}";
-            var apiPsi = new ProcessStartInfo
-            {
-                FileName = CurlExecutable,
-                RedirectStandardOutput = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-            apiPsi.ArgumentList.Add("-s");
-            apiPsi.ArgumentList.Add("-c");
-            apiPsi.ArgumentList.Add(cookieFile);
-            apiPsi.ArgumentList.Add("-b");
-            apiPsi.ArgumentList.Add(cookieFile);
-            apiPsi.ArgumentList.Add("-X");
-            apiPsi.ArgumentList.Add("POST");
-            apiPsi.ArgumentList.Add("https://www.optisport.nl/api/optisport/v1/upcomingeventsschedule");
-            apiPsi.ArgumentList.Add("-H");
-            apiPsi.ArgumentList.Add("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36");
-            apiPsi.ArgumentList.Add("-H");
-            apiPsi.ArgumentList.Add("Accept: application/json, text/plain, */*");
-            apiPsi.ArgumentList.Add("-H");
-            apiPsi.ArgumentList.Add("Referer: https://www.optisport.nl/");
-            apiPsi.ArgumentList.Add("-H");
-            apiPsi.ArgumentList.Add("Origin: https://www.optisport.nl");
-            apiPsi.ArgumentList.Add("-H");
-            apiPsi.ArgumentList.Add("X-Requested-With: XMLHttpRequest");
-            apiPsi.ArgumentList.Add("-H");
-            apiPsi.ArgumentList.Add("Content-Type: application/json");
-            apiPsi.ArgumentList.Add("-H");
-            apiPsi.ArgumentList.Add($"X-CSRF-Token: {token}");
-            apiPsi.ArgumentList.Add("--data-raw");
-            apiPsi.ArgumentList.Add(jsonPayload);
-
-            using var apiProc = Process.Start(apiPsi) ?? throw new InvalidOperationException("Failed to run curl API call.");
-            string json = await apiProc.StandardOutput.ReadToEndAsync();
-            await apiProc.WaitForExitAsync();
-
-            if (json.StartsWith("<") || json.Contains("<html") || string.IsNullOrWhiteSpace(json))
-            {
-                throw new InvalidOperationException($"Optisport upcomingeventsschedule API returned non-JSON/HTML output: {(json.Length > 150 ? json.Substring(0, 150) + "..." : json)}");
-            }
-
-            return ParseDaysFromJson(json);
-        }
-        finally
-        {
-            if (File.Exists(cookieFile))
-            {
-                try { File.Delete(cookieFile); } catch { /* ignore */ }
-            }
-        }
-    }
-
-    private static List<DayScheduleModel> ParseDaysFromJson(string json)
+    public static List<DayScheduleModel> ParseDaysFromJson(string json)
     {
         using var jsonDoc = JsonDocument.Parse(json);
         var root = jsonDoc.RootElement;
@@ -705,50 +633,6 @@ public class PoolScraperService : IPoolScraperService
         return days;
     }
 
-    private async Task<string> FetchHtmlAsync(string url, CancellationToken cancellationToken)
-    {
-        try
-        {
-            var client = _httpClientFactory.CreateClient("PoolScraperClient");
-            var response = await client.GetAsync(url, cancellationToken);
-            if (response.IsSuccessStatusCode)
-            {
-                return await response.Content.ReadAsStringAsync(cancellationToken);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "HttpClient GET to {url} failed. Trying curl process fallback...", url);
-        }
-
-        var psi = new ProcessStartInfo
-        {
-            FileName = CurlExecutable,
-            RedirectStandardOutput = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
-        psi.ArgumentList.Add("-s");
-        psi.ArgumentList.Add("-L");
-        psi.ArgumentList.Add("-A");
-        psi.ArgumentList.Add("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36");
-        psi.ArgumentList.Add(url);
-
-        using var proc = Process.Start(psi) ?? throw new InvalidOperationException("Failed to launch curl process.");
-        string html = await proc.StandardOutput.ReadToEndAsync();
-        await proc.WaitForExitAsync(cancellationToken);
-        return html;
-    }
-
     private static string CleanText(string? text) =>
         string.IsNullOrWhiteSpace(text) ? string.Empty : Regex.Replace(text, @"\s+", " ").Trim();
-
-    private static string CleanRawText(string? text)
-    {
-        if (string.IsNullOrWhiteSpace(text)) return string.Empty;
-        var lines = text.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.RemoveEmptyEntries)
-                        .Select(l => l.Trim())
-                        .Where(l => !string.IsNullOrEmpty(l));
-        return string.Join(Environment.NewLine, lines);
-    }
 }

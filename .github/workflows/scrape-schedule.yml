@@ -16,18 +16,19 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
         with:
-          node-version: 20
+          dotnet-version: '10.0.x'
 
-      - name: Install Playwright & Chromium
-        run: |
-          npm init -y
-          npm install playwright
-          npx playwright install --with-deps chromium
+      - name: Build Solution
+        run: dotnet build --configuration Release
+
+      - name: Install Playwright Browsers & Dependencies
+        run: pwsh SwimmingPoolScheduleNotifier/bin/Release/net10.0/playwright.ps1 install --with-deps chromium
 
       - name: Run Scraper & Send Notification
         env:
           NTFY_TOPIC_URL: 'https://ntfy.sh/zwem-rooster-breda'
-        run: node scraper.js
+          POOL_SCHEDULE_URLS: 'https://www.optisport.nl/activiteiten/banenzwemmen/zwembad-de-wisselaar-breda#locatie,https://www.optisport.nl/activiteiten/banenzwemmen/zwembad-sonsbeeck-breda#locatie'
+        run: dotnet run --no-build --configuration Release --project SwimmingPoolScheduleNotifier/SwimmingPoolScheduleNotifier.csproj
