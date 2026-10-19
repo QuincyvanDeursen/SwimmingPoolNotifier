@@ -507,6 +507,8 @@ public class PoolScraperService : IPoolScraperService
         return ParseDaysFromJson(json);
     }
 
+    private static string CurlExecutable => OperatingSystem.IsWindows() ? "curl.exe" : "curl";
+
     private static async Task<List<DayScheduleModel>> FetchDaysViaCurlFallbackAsync(string locationId, string activityId)
     {
         string cookieFile = Path.Combine(Path.GetTempPath(), $"optisport_cookies_{Guid.NewGuid():N}.txt");
@@ -514,12 +516,19 @@ public class PoolScraperService : IPoolScraperService
         {
             var tokenPsi = new ProcessStartInfo
             {
-                FileName = "curl.exe",
-                Arguments = $"-s -c \"{cookieFile}\" -b \"{cookieFile}\" -H \"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36\" \"https://www.optisport.nl/api/optisport/token\"",
+                FileName = CurlExecutable,
                 RedirectStandardOutput = true,
                 UseShellExecute = false,
                 CreateNoWindow = true
             };
+            tokenPsi.ArgumentList.Add("-s");
+            tokenPsi.ArgumentList.Add("-c");
+            tokenPsi.ArgumentList.Add(cookieFile);
+            tokenPsi.ArgumentList.Add("-b");
+            tokenPsi.ArgumentList.Add(cookieFile);
+            tokenPsi.ArgumentList.Add("-H");
+            tokenPsi.ArgumentList.Add("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36");
+            tokenPsi.ArgumentList.Add("https://www.optisport.nl/api/optisport/token");
 
             using var tokenProc = Process.Start(tokenPsi) ?? throw new InvalidOperationException("Failed to run curl.");
             string token = (await tokenProc.StandardOutput.ReadToEndAsync()).Trim();
@@ -528,12 +537,27 @@ public class PoolScraperService : IPoolScraperService
             string jsonPayload = $"{{\"page\":0,\"locationId\":{locationId},\"activityId\":{activityId},\"amount\":\"medium\"}}";
             var apiPsi = new ProcessStartInfo
             {
-                FileName = "curl.exe",
-                Arguments = $"-s -c \"{cookieFile}\" -b \"{cookieFile}\" -X POST \"https://www.optisport.nl/api/optisport/v1/upcomingeventsschedule\" -H \"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36\" -H \"Content-Type: application/json\" -H \"X-CSRF-Token: {token}\" --data-raw \"{jsonPayload.Replace("\"", "\\\"")}\"",
+                FileName = CurlExecutable,
                 RedirectStandardOutput = true,
                 UseShellExecute = false,
                 CreateNoWindow = true
             };
+            apiPsi.ArgumentList.Add("-s");
+            apiPsi.ArgumentList.Add("-c");
+            apiPsi.ArgumentList.Add(cookieFile);
+            apiPsi.ArgumentList.Add("-b");
+            apiPsi.ArgumentList.Add(cookieFile);
+            apiPsi.ArgumentList.Add("-X");
+            apiPsi.ArgumentList.Add("POST");
+            apiPsi.ArgumentList.Add("https://www.optisport.nl/api/optisport/v1/upcomingeventsschedule");
+            apiPsi.ArgumentList.Add("-H");
+            apiPsi.ArgumentList.Add("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36");
+            apiPsi.ArgumentList.Add("-H");
+            apiPsi.ArgumentList.Add("Content-Type: application/json");
+            apiPsi.ArgumentList.Add("-H");
+            apiPsi.ArgumentList.Add($"X-CSRF-Token: {token}");
+            apiPsi.ArgumentList.Add("--data-raw");
+            apiPsi.ArgumentList.Add(jsonPayload);
 
             using var apiProc = Process.Start(apiPsi) ?? throw new InvalidOperationException("Failed to run curl API call.");
             string json = await apiProc.StandardOutput.ReadToEndAsync();
@@ -658,12 +682,16 @@ public class PoolScraperService : IPoolScraperService
 
         var psi = new ProcessStartInfo
         {
-            FileName = "curl.exe",
-            Arguments = $"-s -L -A \"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36\" \"{url}\"",
+            FileName = CurlExecutable,
             RedirectStandardOutput = true,
             UseShellExecute = false,
             CreateNoWindow = true
         };
+        psi.ArgumentList.Add("-s");
+        psi.ArgumentList.Add("-L");
+        psi.ArgumentList.Add("-A");
+        psi.ArgumentList.Add("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36");
+        psi.ArgumentList.Add(url);
 
         using var proc = Process.Start(psi) ?? throw new InvalidOperationException("Failed to launch curl process.");
         string html = await proc.StandardOutput.ReadToEndAsync();
