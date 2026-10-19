@@ -1,3 +1,5 @@
+using SwimmingPoolScheduleNotifier.Models;
+
 namespace SwimmingPoolScheduleNotifier.Services;
 
 public interface IPoolScraperService

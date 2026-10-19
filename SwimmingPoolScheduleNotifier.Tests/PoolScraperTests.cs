@@ -1,6 +1,7 @@
 using AngleSharp;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
+using SwimmingPoolScheduleNotifier.Models;
 using SwimmingPoolScheduleNotifier.Services;
 using Xunit;
 
