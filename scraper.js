@@ -13,9 +13,15 @@ const POOLS = [
     }
 ];
 
+function extractTime(str) {
+    if (!str) return '';
+    const match = str.match(/T?(\d{2}:\d{2})/);
+    return match ? match[1] : str;
+}
+
 function parseTime(timeStr) {
     if (!timeStr) return null;
-    const match = timeStr.match(/(\d{1,2}):(\d{2})/);
+    const match = timeStr.match(/T?(\d{1,2}):(\d{2})/);
     if (!match) return null;
     return parseInt(match[1], 10) * 60 + parseInt(match[2], 10);
 }
@@ -81,11 +87,35 @@ function isWeekend(dayName) {
     return lower.includes('zaterdag') || lower.includes('zondag');
 }
 
+function parseDateMs(dateStr) {
+    if (!dateStr) return null;
+    const parts = dateStr.includes('-') ? dateStr.split('-') : dateStr.split('/');
+    if (parts.length === 3) {
+        if (parts[0].length === 4) {
+            return new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10)).getTime();
+        } else {
+            return new Date(parseInt(parts[2], 10), parseInt(parts[1], 10) - 1, parseInt(parts[0], 10)).getTime();
+        }
+    }
+    return null;
+}
+
 function formatSchedule(locations) {
     const morningStart = 7 * 60;
     const morningEnd = 9 * 60;
     const afternoonStart = 15 * 60;
     const afternoonEnd = 18 * 60;
+
+    let minDateMs = null;
+    for (const loc of locations) {
+        for (const day of (loc.days || [])) {
+            const ms = parseDateMs(day.date);
+            if (ms !== null && (minDateMs === null || ms < minDateMs)) {
+                minDateMs = ms;
+            }
+        }
+    }
+    const maxDateMs = minDateMs !== null ? minDateMs + 6 * 24 * 60 * 60 * 1000 : null;
 
     const sb = [];
     sb.push('Zwemrooster Breda');
@@ -101,6 +131,9 @@ function formatSchedule(locations) {
             const matchingDays = [];
 
             for (const day of (loc.days || [])) {
+                const dayMs = parseDateMs(day.date);
+                if (maxDateMs !== null && dayMs !== null && dayMs > maxDateMs) continue;
+
                 const isWk = isWeekend(day.day);
                 if (weekendOnly && !isWk) continue;
                 if (weekdayOnly && isWk) continue;
@@ -196,13 +229,17 @@ async function scrapePool(browser, pool) {
             const days = capturedSchedule.slice(0, 7).map(d => ({
                 day: d.day,
                 date: d.date,
-                events: (d.events || []).map(e => ({
-                    title: e.title,
-                    start: e.start,
-                    end: e.end,
-                    displayTime: `${e.start} - ${e.end}`,
-                    internalLocation: e.internalLocation
-                }))
+                events: (d.events || []).map(e => {
+                    const startTime = extractTime(e.start);
+                    const endTime = extractTime(e.end);
+                    return {
+                        title: e.title,
+                        start: startTime,
+                        end: endTime,
+                        displayTime: `${startTime} - ${endTime}`,
+                        internalLocation: e.internalLocation
+                    };
+                })
             }));
             await context.close();
             return { name: pool.name, days };
